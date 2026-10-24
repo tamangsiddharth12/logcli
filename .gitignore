@@ -1,0 +1,6 @@
+/target
+/docs
+*.json
+/output
+/src/output
+*.log

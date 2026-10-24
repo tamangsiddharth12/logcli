@@ -1,0 +1,1105 @@
+commit 2bb101b66de58d137738a6199f96ea577549e355
+Author: Siddharth Tamang <tamangsiddharth12@gmail.com>
+Date:   Tue Jul 28 16:45:13 2026 +0530
+
+    spitting logs into valid and error log
+
+diff --git a/src/main.rs b/src/main.rs
+index dda6d20..dfd6dbd 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -3,8 +3,8 @@ use serde::Deserialize;
+ // use std::io::{BufRead, BufReader};
+ use std::string::ParseError;
+ use thiserror::Error;
+-use tokio::fs::{self, File};
+-use tokio::io::{AsyncBufReadExt, BufReader};
++use tokio::fs::{self, File, OpenOptions, create_dir_all};
++use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+ use tokio::sync::mpsc;
+ 
+ #[derive(Debug, PartialEq, Eq, Deserialize, Clone)]
+@@ -93,6 +93,12 @@ pub struct BatchParseResult {
+     pub error: Vec<LogParseError>,
+ }
+ 
++#[derive(Debug)]
++pub struct StreamSummary {
++    pub valid_count: usize,
++    pub error_count: usize,
++}
++
+ pub fn parse_ndjson_batch(raw: &str) -> BatchParseResult {
+     let mut bpr = BatchParseResult {
+         valid_logs: Vec::new(),
+@@ -189,17 +195,9 @@ pub async fn stream_log_file(
+ pub async fn stream_log_file_mpsc(
+     file_path: &str,
+     channel_capacity: usize,
+-) -> Result<BatchParseResult, Box<dyn std::error::Error>> {
+-    let mut bpr = BatchParseResult {
+-        valid_logs: Vec::new(),
+-        error: Vec::new(),
+-    };
+-
+-    //create a bounded MPSC channel or conveyor belt where raw string lines will be put for processing. in this example, 100 lines
+-
++) -> Result<StreamSummary, Box<dyn std::error::Error>> {
++    //Produce task
+     let (tx, mut rx) = mpsc::channel::<LogItem>(channel_capacity);
+-
+-    //create produce code
+     let path = file_path.to_string();
+ 
+     let reader_handle = tokio::spawn(async move {
+@@ -213,7 +211,6 @@ pub async fn stream_log_file_mpsc(
+                 line_number,
+                 raw_line: line,
+             };
+-
+             if tx.send(item).await.is_err() {
+                 break;
+             }
+@@ -221,30 +218,121 @@ pub async fn stream_log_file_mpsc(
+         Ok::<(), std::io::Error>(())
+     });
+ 
+-    //pull off items from conveyor belt
++    //Output directory for valid log and error log
++    fs::create_dir_all("src/output/").await?;
++
++    let mut valid_file = OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open("src/output/valid_logs.ndjson")
++        .await?;
++    let mut dlq_file = OpenOptions::new()
++        .create(true)
++        .append(true)
++        .open("src/output/dlq_errors.log")
++        .await?;
++
++    let mut summary = StreamSummary {
++        valid_count: 0,
++        error_count: 0,
++    };
++
++    //New consumer logic
++
+     while let Some(item) = rx.recv().await {
+         let trimmed = item.raw_line.trim();
+ 
+         if trimmed.is_empty() {
+-            bpr.error.push(LogParseError::EmptyLine {
+-                line_number: (item.line_number),
+-            });
++            summary.error_count += 1;
++            let err_msg = format!("Line {}: Empty line encountered\n", item.line_number);
++            dlq_file.write_all(err_msg.as_bytes()).await?;
+             continue;
+         }
++
+         match serde_json::from_str::<ProductionLog>(trimmed) {
+-            Ok(log) => {
+-                bpr.valid_logs.push(log);
++            Ok(_log) => {
++                summary.valid_count += 1;
++                let valid_msg = format!(
++                    "Valid incoming log line {} for {}\n",
++                    item.line_number, trimmed
++                );
++                valid_file.write_all(valid_msg.as_bytes()).await?;
++            }
++            Err(err) => {
++                summary.error_count += 1;
++                let err_msg = format!("Line {}: has json invalid data {}\n", item.line_number, err);
++                dlq_file.write_all(err_msg.as_bytes()).await?;
+             }
+-            Err(err) => bpr.error.push(LogParseError::JsonError {
+-                line_number: (item.line_number),
+-                source: (err),
+-            }),
+         }
+     }
+ 
+-    reader_handle.await??; //reade_handle comes from tokio::task which sends join_handlers once toki::spawn() function is invoked
+-    Ok(bpr)
++    reader_handle.await??;
++
++    valid_file.flush().await?;
++    dlq_file.flush().await?;
++
++    Ok(summary)
+ }
++
++// pub async fn stream_log_file_mpsc(
++//     file_path: &str,
++//     channel_capacity: usize,
++// ) -> Result<BatchParseResult, Box<dyn std::error::Error>> {
++//     let mut bpr = BatchParseResult {
++//         valid_logs: Vec::new(),
++//         error: Vec::new(),
++//     };
++
++//     //create a bounded MPSC channel or conveyor belt where raw string lines will be put for processing. in this example, 100 lines
++
++//     let (tx, mut rx) = mpsc::channel::<LogItem>(channel_capacity);
++
++//     //create produce code
++//     let path = file_path.to_string();
++
++//     let reader_handle = tokio::spawn(async move {
++//         let file = File::open(&path).await?;
++//         let reader = BufReader::new(file);
++//         let mut lines = reader.lines();
++//         let mut line_number = 0;
++//         while let Some(line) = lines.next_line().await? {
++//             line_number += 1;
++//             let item = LogItem {
++//                 line_number,
++//                 raw_line: line,
++//             };
++
++//             if tx.send(item).await.is_err() {
++//                 break;
++//             }
++//         }
++//         Ok::<(), std::io::Error>(())
++//     });
++
++//     //pull off items from conveyor belt
++//     while let Some(item) = rx.recv().await {
++//         let trimmed = item.raw_line.trim();
++
++//         if trimmed.is_empty() {
++//             bpr.error.push(LogParseError::EmptyLine {
++//                 line_number: (item.line_number),
++//             });
++//             continue;
++//         }
++//         match serde_json::from_str::<ProductionLog>(trimmed) {
++//             Ok(log) => {
++//                 bpr.valid_logs.push(log);
++//             }
++//             Err(err) => bpr.error.push(LogParseError::JsonError {
++//                 line_number: (item.line_number),
++//                 source: (err),
++//             }),
++//         }
++//     }
++
++//     reader_handle.await??; //reade_handle comes from tokio::task which sends join_handlers once toki::spawn() function is invoked
++//     Ok(bpr)
++// }
+ #[tokio::main]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let sample_ndjson = concat!(
+@@ -267,11 +355,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     println!("Streaming lines from disk\n");
+     //let result = stream_log_file(file_path).await?;
+     let result = stream_log_file_mpsc(file_path, 10).await?;
+-    println!("Parsed {} valid logs from disk.", result.valid_logs.len());
+-    println!("Captured {} DLQ errors from disk:", result.error.len());
+-    for err in &result.error {
+-        println!("  ❌ {}", err);
+-    }
++    // println!("Parsed {} valid logs from disk.", result.valid_logs.len());
++    // println!("Captured {} DLQ errors from disk:", result.error.len());
++    println!("Valid logs written to disk: {}", result.valid_count);
++    println!("error logs written to disk: {}", result.error_count);
++
+     Ok(())
+ 
+     // // let raw_logs = concat!(
+
+commit 61adb3a6edd95686eff292e7c59d8e5e2b9abbb6
+Author: Siddharth Tamang <tamangsiddharth12@gmail.com>
+Date:   Mon Jul 27 16:56:40 2026 +0530
+
+    mpsc channel with tokio sync
+
+diff --git a/src/main.rs b/src/main.rs
+index 6d907d6..dda6d20 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -5,6 +5,7 @@ use std::string::ParseError;
+ use thiserror::Error;
+ use tokio::fs::{self, File};
+ use tokio::io::{AsyncBufReadExt, BufReader};
++use tokio::sync::mpsc;
+ 
+ #[derive(Debug, PartialEq, Eq, Deserialize, Clone)]
+ #[serde(rename_all = "UPPERCASE")]
+@@ -54,6 +55,10 @@ pub enum LogParseError {
+     },
+ }
+ 
++pub struct LogItem {
++    pub line_number: usize,
++    pub raw_line: String,
++}
+ // #[derive(Debug, PartialEq, Eq)]
+ // pub enum LogParseError {
+ //     MissingField(&'static str),
+@@ -180,13 +185,75 @@ pub async fn stream_log_file(
+     //     line_count
+     // );
+ }
++
++pub async fn stream_log_file_mpsc(
++    file_path: &str,
++    channel_capacity: usize,
++) -> Result<BatchParseResult, Box<dyn std::error::Error>> {
++    let mut bpr = BatchParseResult {
++        valid_logs: Vec::new(),
++        error: Vec::new(),
++    };
++
++    //create a bounded MPSC channel or conveyor belt where raw string lines will be put for processing. in this example, 100 lines
++
++    let (tx, mut rx) = mpsc::channel::<LogItem>(channel_capacity);
++
++    //create produce code
++    let path = file_path.to_string();
++
++    let reader_handle = tokio::spawn(async move {
++        let file = File::open(&path).await?;
++        let reader = BufReader::new(file);
++        let mut lines = reader.lines();
++        let mut line_number = 0;
++        while let Some(line) = lines.next_line().await? {
++            line_number += 1;
++            let item = LogItem {
++                line_number,
++                raw_line: line,
++            };
++
++            if tx.send(item).await.is_err() {
++                break;
++            }
++        }
++        Ok::<(), std::io::Error>(())
++    });
++
++    //pull off items from conveyor belt
++    while let Some(item) = rx.recv().await {
++        let trimmed = item.raw_line.trim();
++
++        if trimmed.is_empty() {
++            bpr.error.push(LogParseError::EmptyLine {
++                line_number: (item.line_number),
++            });
++            continue;
++        }
++        match serde_json::from_str::<ProductionLog>(trimmed) {
++            Ok(log) => {
++                bpr.valid_logs.push(log);
++            }
++            Err(err) => bpr.error.push(LogParseError::JsonError {
++                line_number: (item.line_number),
++                source: (err),
++            }),
++        }
++    }
++
++    reader_handle.await??; //reade_handle comes from tokio::task which sends join_handlers once toki::spawn() function is invoked
++    Ok(bpr)
++}
+ #[tokio::main]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let sample_ndjson = concat!(
+-        r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth-service", "level": "ERROR", "http": {"method": "POST", "path": "/api/v1/login", "status": 500, "response_time_ms": 142}}"#,
++        r#"{"timestamp": "2026-07-27T10:00:00Z", "service": "auth-service", "level": "ERROR", "http": {"method": "POST", "path": "/api/v1/login", "status": 500, "response_time_ms": 142}}"#,
++        "\n",
+         "\n",
++        r#"{"timestamp": "2026-07-27T10:00:01Z", "service": "payment-service", "level": "INFO", "http": {"method": "POST", "path": "/api/v2/charge", "status": 200, "response_time_ms": 450}}"#,
+         "\n",
+-        r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "payment-service", "level": "INFO", "http": {"method": "POST", "path": "/api/v2/charge", "status": 200, "response_time_ms": 450}}"#,
++        r#"{"timestamp": "2026-07-27T10:00:02Z", "service": "user-service", "level": "WARN", "http": {"method": "GET", "path": "/api/v1/users", "status": 404, "response_time_ms": 85}}"#,
+         "\n",
+         r#"{"timestamp": "CORRUPTED_LINE_WITHOUT_VALID_JSON"}"#
+     );
+@@ -198,7 +265,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     println!("file created successfully\n");
+ 
+     println!("Streaming lines from disk\n");
+-    let result = stream_log_file(file_path).await?;
++    //let result = stream_log_file(file_path).await?;
++    let result = stream_log_file_mpsc(file_path, 10).await?;
+     println!("Parsed {} valid logs from disk.", result.valid_logs.len());
+     println!("Captured {} DLQ errors from disk:", result.error.len());
+     for err in &result.error {
+
+commit 8b37d4676d8297b41565f17d36934afecd5d835c
+Author: Siddharth Tamang <tamangsiddharth12@gmail.com>
+Date:   Mon Jul 27 15:25:18 2026 +0530
+
+    tokio upgrade
+
+diff --git a/src/main.rs b/src/main.rs
+index a5561d4..6d907d6 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -138,30 +138,57 @@ pub fn extract_high_severity_alerts(logs: Vec<ProductionLog>) -> Vec<ProductionL
+         .collect()
+ }
+ 
+-pub async fn stream_log_file(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+-    let file = File::open(file_path).await?; //Open file asynschronously
+-    let reader = BufReader::new(file); //Wrap the file in an async 8KB buffered memory
++pub async fn stream_log_file(
++    file_path: &str,
++) -> Result<BatchParseResult, Box<dyn std::error::Error>> {
++    let mut bpr = BatchParseResult {
++        valid_logs: Vec::new(),
++        error: Vec::new(),
++    };
++    let mut line_number = 0;
++    let file = File::open(file_path).await?;
++    let reader = BufReader::new(file);
+     let mut lines = reader.lines();
+-    let mut line_count = 0;
+-
+     while let Some(line) = lines.next_line().await? {
+-        line_count += 1;
+-        println!("[Line {}]: {}", line_count, line);
++        line_number += 1;
++        if (line.trim().is_empty()) {
++            bpr.error.push(LogParseError::EmptyLine {
++                line_number: (line_number),
++            });
++            continue;
++        }
++        match serde_json::from_str::<ProductionLog>(line.trim()) {
++            Ok(log) => bpr.valid_logs.push(log),
++            Err(err) => bpr.error.push(LogParseError::JsonError {
++                line_number,
++                source: (err),
++            }),
++        }
+     }
+-    println!(
+-        "\nSuccessfully streamed {} total lines from disk",
+-        line_count
+-    );
+-    Ok(())
++    Ok(bpr)
++    // let file = File::open(file_path).await?; //Open file asynschronously
++    // let reader = BufReader::new(file); //Wrap the file in an async 8KB buffered memory
++    // let mut lines = reader.lines();
++    // let mut line_count = 0;
++
++    // while let Some(line) = lines.next_line().await? {
++    //     line_count += 1;
++    //     println!("[Line {}]: {}", line_count, line);
++    // }
++    // println!(
++    //     "\nSuccessfully streamed {} total lines from disk",
++    //     line_count
++    // );
+ }
+ #[tokio::main]
+ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     let sample_ndjson = concat!(
+         r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth-service", "level": "ERROR", "http": {"method": "POST", "path": "/api/v1/login", "status": 500, "response_time_ms": 142}}"#,
+         "\n",
++        "\n",
+         r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "payment-service", "level": "INFO", "http": {"method": "POST", "path": "/api/v2/charge", "status": 200, "response_time_ms": 450}}"#,
+         "\n",
+-        r#"{"timestamp": "2026-07-24T15:00:02Z", "service": "user-service", "level": "WARN", "http": {"method": "GET", "path": "/api/v1/users", "status": 404, "response_time_ms": 85}}"#,
++        r#"{"timestamp": "CORRUPTED_LINE_WITHOUT_VALID_JSON"}"#
+     );
+ 
+     let file_path = "src/production.log";
+@@ -171,7 +198,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
+     println!("file created successfully\n");
+ 
+     println!("Streaming lines from disk\n");
+-    stream_log_file(file_path).await?;
++    let result = stream_log_file(file_path).await?;
++    println!("Parsed {} valid logs from disk.", result.valid_logs.len());
++    println!("Captured {} DLQ errors from disk:", result.error.len());
++    for err in &result.error {
++        println!("  ❌ {}", err);
++    }
+     Ok(())
+ 
+     // // let raw_logs = concat!(
+
+commit 2f8618ff0097de5c838de0fdb3b0c043a2cd3f3d
+Author: Siddharth Tamang <tamangsiddharth12@gmail.com>
+Date:   Mon Jul 27 15:00:27 2026 +0530
+
+    tokio changes
+
+diff --git a/src/main.rs b/src/main.rs
+index 163cd1a..a5561d4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,21 +1,10 @@
+ use serde::Deserialize;
+-use std::fs::File;
+-use std::io::{BufRead, BufReader};
++// use std::fs::File;
++// use std::io::{BufRead, BufReader};
+ use std::string::ParseError;
+ use thiserror::Error;
+-
+-#[derive(Debug, Error)]
+-pub enum LogParseError {
+-    #[error("Empty log line encountered at line {line_number}")]
+-    EmptyLine { line_number: usize },
+-
+-    #[error("Failed to parse JSON at line {line_number}: {source}")]
+-    JsonError {
+-        line_number: usize,
+-        #[source]
+-        source: serde_json::Error,
+-    },
+-}
++use tokio::fs::{self, File};
++use tokio::io::{AsyncBufReadExt, BufReader};
+ 
+ #[derive(Debug, PartialEq, Eq, Deserialize, Clone)]
+ #[serde(rename_all = "UPPERCASE")]
+@@ -52,6 +41,19 @@ pub struct ProductionLog {
+     pub context: Option<std::collections::HashMap<String, String>>,
+ }
+ 
++#[derive(Debug, Error)]
++pub enum LogParseError {
++    #[error("Empty log line encountered at line {line_number}")]
++    EmptyLine { line_number: usize },
++
++    #[error("Failed to parse JSON at line {line_number}: {source}")]
++    JsonError {
++        line_number: usize,
++        #[source]
++        source: serde_json::Error,
++    },
++}
++
+ // #[derive(Debug, PartialEq, Eq)]
+ // pub enum LogParseError {
+ //     MissingField(&'static str),
+@@ -80,55 +82,40 @@ pub fn parse_log_level(s: &str) -> LogLevel {
+         _ => LogLevel::Unknown,
+     }
+ }
++#[derive(Debug)]
++pub struct BatchParseResult {
++    pub valid_logs: Vec<ProductionLog>,
++    pub error: Vec<LogParseError>,
++}
+ 
+-// fn count_lines(filepath: &str) -> Result<usize, std::io::Error> {
+-//     let file_content = BufReader::new(File::open(filepath)?);
+-//     let mut file_length: usize = 0;
+-//     for _ in file_content.lines() {
+-//         // match x {
+-//         //     Ok(lr) => {
+-//         //         let _ = parse_log_line(&lr);
+-//         //     }
+-//         //     Err(error) => println!("No Log Lines to process because of {:?}", error),
+-//         // }
+-//         file_length += 1;
+-//     }
+-//     Ok(file_length)
+-// }
++pub fn parse_ndjson_batch(raw: &str) -> BatchParseResult {
++    let mut bpr = BatchParseResult {
++        valid_logs: Vec::new(),
++        error: Vec::new(),
++    };
++    for (idx, line) in raw.lines().enumerate() {
++        let line_number = idx + 1;
++        if line.is_empty() {
++            bpr.error.push(LogParseError::EmptyLine {
++                line_number: (line_number),
++            });
++            continue;
++        }
+ 
+-pub fn parse_log_line(line: &str) -> Result<LogRecord, LogParseError> {
+-    let mut ll = line.split(',');
+-    let timestamp = String::from(ll.next().ok_or(LogParseError::MissingField("timestamp"))?);
+-    let service = String::from(ll.next().ok_or(LogParseError::MissingField("service"))?);
+-    let level = parse_log_level(ll.next().ok_or(LogParseError::MissingField("loglevel"))?);
+-    let response_time_raw = ll
+-        .next()
+-        .ok_or(LogParseError::MissingField("response_time_ms"))?;
+-    let response_time_ms: u32 = response_time_raw
+-        .parse()
+-        .map_err(|_| LogParseError::InvalidNumber("response_time_ms"))?;
+-    let status_raw = ll.next().ok_or(LogParseError::MissingField("status"))?;
+-    let status: u16 = status_raw
+-        .parse()
+-        .map_err(|_| LogParseError::InvalidNumber("status"))?;
+-
+-    if ll.next().is_some() {
+-        return Err(LogParseError::ExtraData);
++        match serde_json::from_str::<ProductionLog>(line) {
++            Ok(log) => {
++                bpr.valid_logs.push(log);
++            }
++            Err(err) => {
++                bpr.error.push(LogParseError::JsonError {
++                    line_number: (line_number),
++                    source: (err),
++                });
++            }
++        }
+     }
+ 
+-    Ok(LogRecord {
+-        timestamp,
+-        service,
+-        level,
+-        response_time_ms,
+-        status,
+-    })
+-}
+-
+-pub fn parse_ndjson_batch(raw: &str) -> Vec<ProductionLog> {
+-    raw.lines()
+-        .filter_map(|line| serde_json::from_str::<ProductionLog>(line.trim()).ok())
+-        .collect()
++    bpr
+ }
+ 
+ pub fn calculate_average_latency(logs: &[ProductionLog]) -> f64 {
+@@ -151,29 +138,72 @@ pub fn extract_high_severity_alerts(logs: Vec<ProductionLog>) -> Vec<ProductionL
+         .collect()
+ }
+ 
+-fn main() {
+-    let raw_logs = concat!(
+-        r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth-service", "level": "ERROR", "http": {"method": "POST", "path": "/api/v1/login", "status": 500, "response_time_ms": 142}, "trace": {"trace_id": "tr_881a2", "span_id": "sp_001"}, "context": {"user_id": "usr_9982", "region": "ap-south-1"}}"#,
+-        "\n",
+-        r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "payment-service", "level": "INFO", "http": {"method": "POST", "path": "/api/v2/charge", "status": 200, "response_time_ms": 450}, "trace": {"trace_id": "tr_881a2", "span_id": "sp_002"}, "context": {"gateway": "razorpay", "currency": "INR"}}"#,
+-        "\n",
+-        r#"{"timestamp": "2026-07-24T15:00:02Z", "service": "inventory-service", "level": "FATAL", "http": {"method": "GET", "path": "/api/v1/stock/item_402", "status": 504, "response_time_ms": 3200}, "trace": {"trace_id": "tr_903c1", "span_id": "sp_010"}, "context": {"db_cluster": "main-pg-replica"}}"#,
+-        "\n",
+-        r#"{"timestamp": "2026-07-24T15:00:03Z", "service": "search-service", "level": "INFO", "http": {"method": "GET", "path": "/api/v1/search?q=rust", "status": 200, "response_time_ms": 18}}"#,
++pub async fn stream_log_file(file_path: &str) -> Result<(), Box<dyn std::error::Error>> {
++    let file = File::open(file_path).await?; //Open file asynschronously
++    let reader = BufReader::new(file); //Wrap the file in an async 8KB buffered memory
++    let mut lines = reader.lines();
++    let mut line_count = 0;
++
++    while let Some(line) = lines.next_line().await? {
++        line_count += 1;
++        println!("[Line {}]: {}", line_count, line);
++    }
++    println!(
++        "\nSuccessfully streamed {} total lines from disk",
++        line_count
++    );
++    Ok(())
++}
++#[tokio::main]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let sample_ndjson = concat!(
++        r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth-service", "level": "ERROR", "http": {"method": "POST", "path": "/api/v1/login", "status": 500, "response_time_ms": 142}}"#,
+         "\n",
+-        r#"{"timestamp": "2026-07-24T15:00:04Z", "service": "user-service", "level": "WARN", "http": {"method": "GET", "path": "/api/v1/users/usr_0000", "status": 404, "response_time_ms": 65}, "context": {"reason": "user_not_found"}}"#,
++        r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "payment-service", "level": "INFO", "http": {"method": "POST", "path": "/api/v2/charge", "status": 200, "response_time_ms": 450}}"#,
+         "\n",
+-        r#"{"timestamp": "CORRUPTED_LINE_WITHOUT_VALID_JSON"}"#
++        r#"{"timestamp": "2026-07-24T15:00:02Z", "service": "user-service", "level": "WARN", "http": {"method": "GET", "path": "/api/v1/users", "status": 404, "response_time_ms": 85}}"#,
+     );
+ 
+-    let logs = parse_ndjson_batch(raw_logs);
+-    println!("successfully parsed {:?} valid logs", logs);
++    let file_path = "src/production.log";
++
++    println!("write simple jsn to file: {}", file_path);
++    fs::write(file_path, sample_ndjson).await?;
++    println!("file created successfully\n");
++
++    println!("Streaming lines from disk\n");
++    stream_log_file(file_path).await?;
++    Ok(())
++
++    // // let raw_logs = concat!(
++    // //     r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth-service", "level": "ERROR", "http": {"method": "POST", "path": "/api/v1/login", "status": 500, "response_time_ms": 142}}"#,
++    // //     "\n",
++    // //     "\n",
++    // //     r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "payment-service", "level": "INFO", "http": {"method": "POST", "path": "/api/v2/charge", "status": 200, "response_time_ms": 450}}"#,
++    // //     "\n",
++    // //     r#"{"timestamp": "CORRUPTED_LINE_WITHOUT_VALID_JSON"}"#
++    // // );
++    // let file_path = "src/log.json";
++    // let file = File::open(file_path).await?;
++
++    // let reader = BufReader::new(file);
++
++    // let mut lines = reader.lines();
++
++    // let mut line_count = 0;
++
++    // let logs = parse_ndjson_batch(raw_logs);
++    // println!("successfully parsed {:?} valid logs", logs.valid_logs.len());
++    // println!("captured {:?} errors:\n", logs.error.len());
++
++    // for err in logs.error {
++    //     println!(" DLQ routing -> {}", err);
++    // }
+ 
+-    let avg_latency = calculate_average_latency(&logs);
+-    println!("average latency in ms {:?}", avg_latency);
++    // let avg_latency = calculate_average_latency(&logs);
++    // println!("average latency in ms {:?}", avg_latency);
+ 
+-    let alerts = extract_high_severity_alerts(logs);
+-    println!("Extracted {:?} high severity alerts", alerts.len());
++    // let alerts = extract_high_severity_alerts(logs);
++    // println!("Extracted {:?} high severity alerts", alerts.len());
+ }
+ 
+ #[cfg(test)]
+
+commit c73f331cfbce5f4ac38dda241378e1899d01e238
+Author: Siddharth Tamang <tamangsiddharth12@gmail.com>
+Date:   Mon Jul 27 11:14:03 2026 +0530
+
+    chapter 1.7
+
+diff --git a/src/main.rs b/src/main.rs
+index 25e13e4..163cd1a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,8 +1,24 @@
++use serde::Deserialize;
+ use std::fs::File;
+ use std::io::{BufRead, BufReader};
+ use std::string::ParseError;
++use thiserror::Error;
+ 
+-#[derive(Debug, PartialEq, Eq)]
++#[derive(Debug, Error)]
++pub enum LogParseError {
++    #[error("Empty log line encountered at line {line_number}")]
++    EmptyLine { line_number: usize },
++
++    #[error("Failed to parse JSON at line {line_number}: {source}")]
++    JsonError {
++        line_number: usize,
++        #[source]
++        source: serde_json::Error,
++    },
++}
++
++#[derive(Debug, PartialEq, Eq, Deserialize, Clone)]
++#[serde(rename_all = "UPPERCASE")]
+ pub enum LogLevel {
+     Info,
+     Warn,
+@@ -12,13 +28,37 @@ pub enum LogLevel {
+     Unknown,
+ }
+ 
+-#[derive(Debug, PartialEq, Eq)]
+-pub enum LogParseError {
+-    MissingField(&'static str),
+-    InvalidNumber(&'static str),
+-    ExtraData,
++#[derive(Debug, Deserialize, Clone)]
++pub struct HttpContext {
++    pub method: String,
++    pub path: String,
++    pub status: u16,
++    pub response_time_ms: u32,
+ }
+ 
++#[derive(Debug, Deserialize, Clone)]
++pub struct TraceContext {
++    pub trace_id: String,
++    pub span_id: String,
++}
++
++#[derive(Debug, Deserialize, Clone)]
++pub struct ProductionLog {
++    pub timestamp: String,
++    pub service: String,
++    pub level: LogLevel,
++    pub http: HttpContext,
++    pub trace: Option<TraceContext>,
++    pub context: Option<std::collections::HashMap<String, String>>,
++}
++
++// #[derive(Debug, PartialEq, Eq)]
++// pub enum LogParseError {
++//     MissingField(&'static str),
++//     InvalidNumber(&'static str),
++//     ExtraData,
++// }
++
+ #[derive(Debug, PartialEq, Eq)]
+ pub struct LogRecord {
+     pub timestamp: String,
+@@ -41,20 +81,20 @@ pub fn parse_log_level(s: &str) -> LogLevel {
+     }
+ }
+ 
+-fn count_lines(filepath: &str) -> Result<usize, std::io::Error> {
+-    let file_content = BufReader::new(File::open(filepath)?);
+-    let mut file_length: usize = 0;
+-    for _ in file_content.lines() {
+-        // match x {
+-        //     Ok(lr) => {
+-        //         let _ = parse_log_line(&lr);
+-        //     }
+-        //     Err(error) => println!("No Log Lines to process because of {:?}", error),
+-        // }
+-        file_length += 1;
+-    }
+-    Ok(file_length)
+-}
++// fn count_lines(filepath: &str) -> Result<usize, std::io::Error> {
++//     let file_content = BufReader::new(File::open(filepath)?);
++//     let mut file_length: usize = 0;
++//     for _ in file_content.lines() {
++//         // match x {
++//         //     Ok(lr) => {
++//         //         let _ = parse_log_line(&lr);
++//         //     }
++//         //     Err(error) => println!("No Log Lines to process because of {:?}", error),
++//         // }
++//         file_length += 1;
++//     }
++//     Ok(file_length)
++// }
+ 
+ pub fn parse_log_line(line: &str) -> Result<LogRecord, LogParseError> {
+     let mut ll = line.split(',');
+@@ -85,27 +125,122 @@ pub fn parse_log_line(line: &str) -> Result<LogRecord, LogParseError> {
+     })
+ }
+ 
++pub fn parse_ndjson_batch(raw: &str) -> Vec<ProductionLog> {
++    raw.lines()
++        .filter_map(|line| serde_json::from_str::<ProductionLog>(line.trim()).ok())
++        .collect()
++}
++
++pub fn calculate_average_latency(logs: &[ProductionLog]) -> f64 {
++    if logs.is_empty() {
++        return 0.0;
++    }
++    let sum_of_response_time_ms = logs
++        .iter()
++        .map(|log| log.http.response_time_ms)
++        .sum::<u32>();
++
++    return sum_of_response_time_ms as f64 / logs.len() as f64;
++}
++
++pub fn extract_high_severity_alerts(logs: Vec<ProductionLog>) -> Vec<ProductionLog> {
++    logs.into_iter()
++        .filter(|log| {
++            log.http.status >= 400 || log.level == LogLevel::Error || log.level == LogLevel::Fatal
++        })
++        .collect()
++}
++
+ fn main() {
+-    let file_size = count_lines("src/log.json");
+-    match file_size {
+-        Ok(value) => {
+-            println!("size of file length is {}", value);
+-        }
+-        Err(error) => {
+-            println!("Error encountered {}", error);
+-        }
++    let raw_logs = concat!(
++        r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth-service", "level": "ERROR", "http": {"method": "POST", "path": "/api/v1/login", "status": 500, "response_time_ms": 142}, "trace": {"trace_id": "tr_881a2", "span_id": "sp_001"}, "context": {"user_id": "usr_9982", "region": "ap-south-1"}}"#,
++        "\n",
++        r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "payment-service", "level": "INFO", "http": {"method": "POST", "path": "/api/v2/charge", "status": 200, "response_time_ms": 450}, "trace": {"trace_id": "tr_881a2", "span_id": "sp_002"}, "context": {"gateway": "razorpay", "currency": "INR"}}"#,
++        "\n",
++        r#"{"timestamp": "2026-07-24T15:00:02Z", "service": "inventory-service", "level": "FATAL", "http": {"method": "GET", "path": "/api/v1/stock/item_402", "status": 504, "response_time_ms": 3200}, "trace": {"trace_id": "tr_903c1", "span_id": "sp_010"}, "context": {"db_cluster": "main-pg-replica"}}"#,
++        "\n",
++        r#"{"timestamp": "2026-07-24T15:00:03Z", "service": "search-service", "level": "INFO", "http": {"method": "GET", "path": "/api/v1/search?q=rust", "status": 200, "response_time_ms": 18}}"#,
++        "\n",
++        r#"{"timestamp": "2026-07-24T15:00:04Z", "service": "user-service", "level": "WARN", "http": {"method": "GET", "path": "/api/v1/users/usr_0000", "status": 404, "response_time_ms": 65}, "context": {"reason": "user_not_found"}}"#,
++        "\n",
++        r#"{"timestamp": "CORRUPTED_LINE_WITHOUT_VALID_JSON"}"#
++    );
++
++    let logs = parse_ndjson_batch(raw_logs);
++    println!("successfully parsed {:?} valid logs", logs);
++
++    let avg_latency = calculate_average_latency(&logs);
++    println!("average latency in ms {:?}", avg_latency);
++
++    let alerts = extract_high_severity_alerts(logs);
++    println!("Extracted {:?} high severity alerts", alerts.len());
++}
++
++#[cfg(test)]
++mod test_cases {
++    use super::*;
++
++    #[test]
++    fn test_parse_ndjson_batch_skips_corrupted_lines() {
++        let raw = concat!(
++            r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth", "level": "ERROR", "http": {"method": "POST", "path": "/login", "status": 500, "response_time_ms": 100}}"#,
++            "\n",
++            r#"CORRUPTED_LINE_HERE"#,
++            "\n",
++            r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "payment", "level": "INFO", "http": {"method": "GET", "path": "/pay", "status": 200, "response_time_ms": 200}}"#
++        );
++        let logs = parse_ndjson_batch(raw);
++
++        assert_eq!(
++            logs.len(),
++            2,
++            "Should parse exactly 2 valid logs and drop 1 corrupted line"
++        );
++        assert_eq!(logs[0].service, "auth");
++        assert_eq!(logs[1].service, "payment");
+     }
+ 
+-    //println!("loglevel is {:?}", parse_log_level("Info"));
+-    //println!("loglevel is {:?}", parse_log_level("INVALID_DATA"));
++    #[test]
++    fn test_calculate_average_latency_normal_and_empty() {
++        let raw = concat!(
++            r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth", "level": "INFO", "http": {"method": "GET", "path": "/a", "status": 200, "response_time_ms": 100}}"#,
++            "\n",
++            r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "auth", "level": "INFO", "http": {"method": "GET", "path": "/b", "status": 200, "response_time_ms": 300}}"#
++        );
++        let logs = parse_ndjson_batch(raw);
++        let avg = calculate_average_latency(&logs);
++        assert_eq!(avg, 200.0, "Average of 100ms and 300ms should be 200ms");
+ 
+-    let valid = "2026-07-24T15:00:00Z,auth-service,INFO,142,200";
+-    let bad_num = "2026-07-24T15:00:00Z,auth-service,INFO,NOT_A_NUMBER,200";
+-    let missing = "2026-07-24T15:00:00Z,auth-service";
+-    let extra = "2026-07-24T15:00:00Z,auth-service,INFO,142,200,EXTRA_FIELD";
++        let empty_logs: Vec<ProductionLog> = Vec::new();
++        let empty_avg = calculate_average_latency(&empty_logs);
++        assert_eq!(
++            empty_avg, 0.0,
++            "Empty logs slice should safely return 0.0 without panicking"
++        );
++    }
++
++    #[test]
++    fn test_extract_high_seveiry_alerts_criteria() {
++        let raw = concat!(
++            // 1. Status >= 400 (matches)
++            r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "s1", "level": "INFO", "http": {"method": "GET", "path": "/1", "status": 404, "response_time_ms": 50}}"#,
++            "\n",
++            // 2. Level ERROR (matches)
++            r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "s2", "level": "ERROR", "http": {"method": "GET", "path": "/2", "status": 200, "response_time_ms": 50}}"#,
++            "\n",
++            // 3. Level FATAL (matches)
++            r#"{"timestamp": "2026-07-24T15:00:02Z", "service": "s3", "level": "FATAL", "http": {"method": "GET", "path": "/3", "status": 200, "response_time_ms": 50}}"#,
++            "\n",
++            // 4. INFO + Status 200 (should BE FILTERED OUT)
++            r#"{"timestamp": "2026-07-24T15:00:03Z", "service": "s4", "level": "INFO", "http": {"method": "GET", "path": "/4", "status": 200, "response_time_ms": 50}}"#
++        );
+ 
+-    println!("Valid: {:?}", parse_log_line(valid));
+-    println!("Bad Number: {:?}", parse_log_line(bad_num));
+-    println!("Missing Field: {:?}", parse_log_line(missing));
+-    println!("Extra Field: {:?}", parse_log_line(extra));
++        let logs = parse_ndjson_batch(raw);
++        let alerts = extract_high_severity_alerts(logs);
++
++        assert_eq!(alerts.len(), 3, "Only 3 alerting records should pass");
++        assert_eq!(alerts[0].service, "s1");
++        assert_eq!(alerts[1].service, "s2");
++        assert_eq!(alerts[2].service, "s3");
++    }
+ }
+
+commit 00eb6534e771f143c6e58ec9927c78cc8645c32f
+Author: Siddharth Tamang <tamangsiddharth12@gmail.com>
+Date:   Fri Jul 24 17:07:40 2026 +0530
+
+    chapter 1.6 log parser strict line validation
+
+diff --git a/src/main.rs b/src/main.rs
+index 7149657..25e13e4 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,5 +1,6 @@
+ use std::fs::File;
+ use std::io::{BufRead, BufReader};
++use std::string::ParseError;
+ 
+ #[derive(Debug, PartialEq, Eq)]
+ pub enum LogLevel {
+@@ -11,6 +12,13 @@ pub enum LogLevel {
+     Unknown,
+ }
+ 
++#[derive(Debug, PartialEq, Eq)]
++pub enum LogParseError {
++    MissingField(&'static str),
++    InvalidNumber(&'static str),
++    ExtraData,
++}
++
+ #[derive(Debug, PartialEq, Eq)]
+ pub struct LogRecord {
+     pub timestamp: String,
+@@ -48,15 +56,27 @@ fn count_lines(filepath: &str) -> Result<usize, std::io::Error> {
+     Ok(file_length)
+ }
+ 
+-pub fn parse_log_line(line: &str) -> Option<LogRecord> {
++pub fn parse_log_line(line: &str) -> Result<LogRecord, LogParseError> {
+     let mut ll = line.split(',');
+-    let timestamp = String::from(ll.next()?);
+-    let service = String::from(ll.next()?);
+-    let level = parse_log_level(ll.next()?);
+-    let response_time_ms: u32 = ll.next()?.parse().ok()?;
+-    let status: u16 = ll.next()?.parse().ok()?;
++    let timestamp = String::from(ll.next().ok_or(LogParseError::MissingField("timestamp"))?);
++    let service = String::from(ll.next().ok_or(LogParseError::MissingField("service"))?);
++    let level = parse_log_level(ll.next().ok_or(LogParseError::MissingField("loglevel"))?);
++    let response_time_raw = ll
++        .next()
++        .ok_or(LogParseError::MissingField("response_time_ms"))?;
++    let response_time_ms: u32 = response_time_raw
++        .parse()
++        .map_err(|_| LogParseError::InvalidNumber("response_time_ms"))?;
++    let status_raw = ll.next().ok_or(LogParseError::MissingField("status"))?;
++    let status: u16 = status_raw
++        .parse()
++        .map_err(|_| LogParseError::InvalidNumber("status"))?;
++
++    if ll.next().is_some() {
++        return Err(LogParseError::ExtraData);
++    }
+ 
+-    Some(LogRecord {
++    Ok(LogRecord {
+         timestamp,
+         service,
+         level,
+@@ -79,11 +99,13 @@ fn main() {
+     //println!("loglevel is {:?}", parse_log_level("Info"));
+     //println!("loglevel is {:?}", parse_log_level("INVALID_DATA"));
+ 
+-    let valid_line = "2026-07-24T15:00:00Z,auth-service,INFO,142,200";
+-    let bad_number = "2026-07-24T15:00:00Z,auth-service,INFO,NOT_A_NUMBER,200";
+-    let missing_field = "2026-07-24T15:00:00Z,auth-service";
++    let valid = "2026-07-24T15:00:00Z,auth-service,INFO,142,200";
++    let bad_num = "2026-07-24T15:00:00Z,auth-service,INFO,NOT_A_NUMBER,200";
++    let missing = "2026-07-24T15:00:00Z,auth-service";
++    let extra = "2026-07-24T15:00:00Z,auth-service,INFO,142,200,EXTRA_FIELD";
+ 
+-    println!("Valid: {:?}", parse_log_line(valid_line));
+-    println!("Bad Number: {:?}", parse_log_line(bad_number));
+-    println!("Missing Field: {:?}", parse_log_line(missing_field));
++    println!("Valid: {:?}", parse_log_line(valid));
++    println!("Bad Number: {:?}", parse_log_line(bad_num));
++    println!("Missing Field: {:?}", parse_log_line(missing));
++    println!("Extra Field: {:?}", parse_log_line(extra));
+ }
+
+commit c73de1b6313549c53444f0e26048205bcd4681d6
+Author: Siddharth Tamang <tamangsiddharth12@gmail.com>
+Date:   Fri Jul 24 16:23:17 2026 +0530
+
+    chapter 1.6 struct and line parse
+
+diff --git a/src/main.rs b/src/main.rs
+new file mode 100644
+index 0000000..7149657
+--- /dev/null
++++ b/src/main.rs
+@@ -0,0 +1,89 @@
++use std::fs::File;
++use std::io::{BufRead, BufReader};
++
++#[derive(Debug, PartialEq, Eq)]
++pub enum LogLevel {
++    Info,
++    Warn,
++    Error,
++    Debug,
++    Fatal,
++    Unknown,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub struct LogRecord {
++    pub timestamp: String,
++    pub service: String,
++    pub level: LogLevel,
++    pub response_time_ms: u32,
++    pub status: u16,
++}
++
++pub fn parse_log_level(s: &str) -> LogLevel {
++    let upper_str = &s.to_uppercase();
++    match upper_str.as_str() {
++        "INFO" => LogLevel::Info,
++        "WARN" => LogLevel::Warn,
++        "ERROR" => LogLevel::Error,
++        "DEBUG" => LogLevel::Debug,
++        "FATAL" => LogLevel::Fatal,
++        "UNKNOWN" => LogLevel::Unknown,
++        _ => LogLevel::Unknown,
++    }
++}
++
++fn count_lines(filepath: &str) -> Result<usize, std::io::Error> {
++    let file_content = BufReader::new(File::open(filepath)?);
++    let mut file_length: usize = 0;
++    for _ in file_content.lines() {
++        // match x {
++        //     Ok(lr) => {
++        //         let _ = parse_log_line(&lr);
++        //     }
++        //     Err(error) => println!("No Log Lines to process because of {:?}", error),
++        // }
++        file_length += 1;
++    }
++    Ok(file_length)
++}
++
++pub fn parse_log_line(line: &str) -> Option<LogRecord> {
++    let mut ll = line.split(',');
++    let timestamp = String::from(ll.next()?);
++    let service = String::from(ll.next()?);
++    let level = parse_log_level(ll.next()?);
++    let response_time_ms: u32 = ll.next()?.parse().ok()?;
++    let status: u16 = ll.next()?.parse().ok()?;
++
++    Some(LogRecord {
++        timestamp,
++        service,
++        level,
++        response_time_ms,
++        status,
++    })
++}
++
++fn main() {
++    let file_size = count_lines("src/log.json");
++    match file_size {
++        Ok(value) => {
++            println!("size of file length is {}", value);
++        }
++        Err(error) => {
++            println!("Error encountered {}", error);
++        }
++    }
++
++    //println!("loglevel is {:?}", parse_log_level("Info"));
++    //println!("loglevel is {:?}", parse_log_level("INVALID_DATA"));
++
++    let valid_line = "2026-07-24T15:00:00Z,auth-service,INFO,142,200";
++    let bad_number = "2026-07-24T15:00:00Z,auth-service,INFO,NOT_A_NUMBER,200";
++    let missing_field = "2026-07-24T15:00:00Z,auth-service";
++
++    println!("Valid: {:?}", parse_log_line(valid_line));
++    println!("Bad Number: {:?}", parse_log_line(bad_number));
++    println!("Missing Field: {:?}", parse_log_line(missing_field));
++}
