@@ -1,7 +1,6 @@
 use super::app::{ActivePane, App};
 use ratatui::{
     Frame,
-    backend::Backend,
     layout::{Alignment, Constraint, Direction, Layout, Margin},
     style::{Color, Modifier, Style},
     widgets::{
@@ -18,7 +17,7 @@ pub fn render(f: &mut Frame, app: &App, fetcher: &crate::tui::fetcher::RecordFet
             Constraint::Min(10),   //Main content split pane
             Constraint::Length(3), //Footer keybindings
         ])
-        .split(f.size());
+        .split(f.area());
 
     let content_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -28,6 +27,14 @@ pub fn render(f: &mut Frame, app: &App, fetcher: &crate::tui::fetcher::RecordFet
     // Render top: Search / Active filter Header
     let header_text = if app.is_filtering {
         format!(" FILTER PROMPT : /{}", app.filter_input)
+    } else if app.filter_in_progress {
+        format!(
+            " ⏳ Filtering '{}' — scanned {} / {} records, {} matches so far...",
+            app.filter_input,
+            app.filter_scanned,
+            app.record_offsets.len(),
+            app.filtered_indices.len()
+        )
     } else {
         let filter_status = match &app.active_predicate {
             Some(_) => format!("Active Filter --> {}", app.filter_input),
@@ -50,6 +57,22 @@ pub fn render(f: &mut Frame, app: &App, fetcher: &crate::tui::fetcher::RecordFet
     let header_paragraph = Paragraph::new(header_text).block(header_block);
 
     f.render_widget(header_paragraph, root_chunks[0]);
+
+    // While typing a filter, show the terminal cursor right after the input
+    // text so the prompt behaves like a normal text field.
+    if app.is_filtering {
+        let inner = root_chunks[0].inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+        let prompt = format!(" FILTER PROMPT : /{}", app.filter_input);
+        // chars().count() approximates display width (input is typed text)
+        let cursor_x = inner.x + prompt.chars().count() as u16;
+        f.set_cursor_position((
+            cursor_x.min(inner.x.saturating_add(inner.width.saturating_sub(1))),
+            inner.y,
+        ));
+    }
 
     //left pane -> Log stream list
     let total_visible = app.filtered_indices.len();
@@ -185,7 +208,7 @@ pub fn render(f: &mut Frame, app: &App, fetcher: &crate::tui::fetcher::RecordFet
     f.render_widget(status_bar, root_chunks[2]);
 }
 
-pub fn render_loading(f: &mut Frame, app: &App) {
+pub fn render_loading(f: &mut Frame, _app: &App) {
     let root_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -193,7 +216,7 @@ pub fn render_loading(f: &mut Frame, app: &App) {
             Constraint::Min(10),
             Constraint::Length(3),
         ])
-        .split(f.size());
+        .split(f.area());
 
     let loading_text = " ⏳ Indexing JSON file... Please wait... ";
     let loading_paragraph = Paragraph::new(loading_text)

@@ -2,16 +2,16 @@ use memmap2::Mmap;
 use lru::LruCache;
 use serde_json::Value;
 use std::num::NonZeroUsize;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 pub struct RecordFetcher {
     mmap: Mmap,
-    offsets: Vec<u64>,
+    offsets: Arc<Vec<u64>>,
     cache: Mutex<LruCache<usize, Value>>,
 }
 
 impl RecordFetcher {
-    pub fn new(mmap: Mmap, offsets: Vec<u64>) -> Self {
+    pub fn new(mmap: Mmap, offsets: Arc<Vec<u64>>) -> Self {
         Self {
             mmap,
             offsets,

@@ -40,6 +40,12 @@ pub struct CsvExporter {
     rows: Vec<BTreeMap<String, Value>>,
 }
 
+impl Default for CsvExporter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CsvExporter {
     pub fn new() -> Self {
         Self { rows: Vec::new() }

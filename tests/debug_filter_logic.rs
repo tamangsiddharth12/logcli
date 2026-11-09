@@ -20,7 +20,7 @@ fn test_debug_filter_logic() {
     // offsets: start of each line
     let offsets = vec![0u64, (line1.len() + 1) as u64];
     let mmap = unsafe { Mmap::map(&File::open(&tmp_path).unwrap()).unwrap() };
-    let fetcher = RecordFetcher::new(mmap, offsets);
+    let fetcher = RecordFetcher::new(mmap, std::sync::Arc::new(offsets));
     let pred = CompoundPredicate::parse("level==INFO").unwrap();
     let val = fetcher.fetch_record(0).expect("fetch record 0");
     assert!(pred.evaluate(&val), "predicate should match first record");

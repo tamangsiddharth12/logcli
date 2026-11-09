@@ -16,7 +16,7 @@ fn test_fetcher_reads_first_line() {
     file.flush().unwrap();
     let offsets = vec![0u64, line1.len() as u64];
     let mmap = unsafe { Mmap::map(&File::open(&tmp_path).unwrap()).unwrap() };
-    let fetcher = RecordFetcher::new(mmap, offsets);
+    let fetcher = RecordFetcher::new(mmap, std::sync::Arc::new(offsets));
     let val = fetcher.fetch_record(0).expect("fetch record 0");
     assert_eq!(val, json!({"level": "INFO", "http": {"status": 200}}));
 }
