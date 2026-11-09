@@ -9,7 +9,7 @@ use crossterm::{
     event::{
         self,
         Event::{self},
-        KeyCode, KeyEvent, KeyEventKind,
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -37,6 +37,14 @@ pub fn handle_events(
     fetcher: Option<&crate::tui::fetcher::RecordFetcher>,
     key: KeyEvent,
 ) -> io::Result<()> {
+    // Ctrl+C quits from anywhere (standard terminal convention). Plain 'q'
+    // inside the prompt is typed text — filter values may contain it
+    // (e.g. service == query-service); press Esc first, then 'q'.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.is_running = false;
+        return Ok(());
+    }
+
     if app.is_filtering {
         match key.code {
             KeyCode::Enter => {

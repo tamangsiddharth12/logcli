@@ -194,15 +194,19 @@ pub fn render(f: &mut Frame, app: &App, fetcher: &crate::tui::fetcher::RecordFet
     }
 
     //3. Footer Bar
-    let status_status = if app.is_finished {
+    let status_status = if app.filter_in_progress {
+        "STATUS: Filtering ⏳"
+    } else if app.is_finished {
         "STATUS: Complete ⚪"
     } else {
         "STATUS: Streaming 🟢"
     };
-    let status_text = format!(
-        " {} | Keys: [/] Filter | [↑/↓] Navigate | [q] Quit",
-        status_status
-    );
+    let keys_hint = if app.is_filtering {
+        "Keys: type query | [Enter] apply | [Esc] cancel | [Ctrl+C] quit"
+    } else {
+        "Keys: [/] Filter | [↑/↓] Navigate | [q] Quit"
+    };
+    let status_text = format!(" {} | {}", status_status, keys_hint);
     let status_bar =
         Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(Color::White));
     f.render_widget(status_bar, root_chunks[2]);
