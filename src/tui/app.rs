@@ -1,6 +1,5 @@
-use serde_json::Value;
 
-use crate::filter::{CompoundPredicate, FilterEngine};
+use crate::filter::CompoundPredicate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActivePane {
@@ -39,9 +38,9 @@ impl App {
 
     pub fn toggle_pane(&mut self) {
         self.active_pane = match self.active_pane {
-            ActivePane::Inspector => ActivePane::Inspector,
-            ActivePane::LogList => ActivePane::LogList,
-        }
+            ActivePane::Inspector => ActivePane::LogList,
+            ActivePane::LogList => ActivePane::Inspector,
+        };
     }
 
     pub fn scroll_inspector_down(&mut self, total_lines: u16, viewport_height: u16) {

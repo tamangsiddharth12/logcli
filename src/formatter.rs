@@ -1,5 +1,6 @@
 use clap::ValueEnum;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, ValueEnum)]
 pub enum OutputFormat {
@@ -14,36 +15,72 @@ impl Formatter {
     pub fn format(
         val: &Value,
         format: OutputFormat,
-        write_header: bool,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match format {
             OutputFormat::Ndjson => Ok(serde_json::to_string(val)?),
             OutputFormat::PrettyJson => Ok(serde_json::to_string_pretty(val)?),
-            OutputFormat::Csv => {
-                let mut wtr = csv::WriterBuilder::new()
-                    .has_headers(write_header)
-                    .from_writer(vec![]);
+            // CSV is rendered by CsvExporter after the stream ends, so the
+            // header can cover the union of every record's keys.
+            OutputFormat::Csv => Err(
+                "CSV output is collected and rendered by CsvExporter after the stream finishes"
+                    .into(),
+            ),
+        }
+    }
+}
 
-                if let Some(obj) = val.as_object() {
-                    if write_header {
-                        let headers: Vec<&str> = obj.keys().map(|k| k.as_str()).collect();
-                        wtr.write_record(&headers);
-                    }
+/// Buffered CSV exporter. Collects all projected records, then renders a
+/// header from the sorted union of their keys and rows aligned to those
+/// columns (missing keys become empty cells). This fixes the misalignment
+/// that occurred when records had heterogeneous key sets.
+///
+/// Memory note: rows are held in memory until the stream ends, so CSV export
+/// size is bounded by output size. NDJSON / pretty-JSON stay fully streaming.
+pub struct CsvExporter {
+    rows: Vec<BTreeMap<String, Value>>,
+}
 
-                    let row: Vec<String> = obj
-                        .values()
-                        .map(|v| match v {
-                            Value::String(s) => s.clone(),
-                            Value::Null => String::new(),
-                            _ => v.to_string(),
-                        })
-                        .collect();
-                    wtr.write_record(&row)?;
+impl CsvExporter {
+    pub fn new() -> Self {
+        Self { rows: Vec::new() }
+    }
+
+    pub fn push(&mut self, val: &Value) {
+        if let Some(obj) = val.as_object() {
+            let row: BTreeMap<String, Value> = obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            self.rows.push(row);
+        }
+    }
+
+    pub fn render(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        // Union of keys across all rows, sorted for a deterministic header.
+        let mut header: Vec<String> = Vec::new();
+        for row in &self.rows {
+            for key in row.keys() {
+                if !header.contains(key) {
+                    header.push(key.clone());
                 }
-
-                let bytes = wtr.into_inner()?;
-                Ok(String::from_utf8(bytes)?.trim_end().to_string())
             }
         }
+        header.sort();
+
+        let mut wtr = csv::WriterBuilder::new().from_writer(vec![]);
+
+        wtr.write_record(&header)?;
+
+        for row in &self.rows {
+            let record: Vec<String> = header
+                .iter()
+                .map(|k| match row.get(k) {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) | None => String::new(),
+                    Some(v) => v.to_string(),
+                })
+                .collect();
+            wtr.write_record(&record)?;
+        }
+
+        let bytes = wtr.into_inner()?;
+        Ok(String::from_utf8(bytes)?.trim_end().to_string())
     }
 }

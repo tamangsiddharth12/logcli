@@ -1,9 +1,7 @@
 use clap::Parser;
-use colored::*;
 
 use memchr::memchr;
 use memmap2::Mmap;
-use std::fs::File;
 use tokio::sync::mpsc::Sender;
 
 pub mod filter;

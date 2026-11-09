@@ -2,7 +2,7 @@ use memmap2::Mmap;
 use lru::LruCache;
 use serde_json::Value;
 use std::num::NonZeroUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 pub struct RecordFetcher {
     mmap: Mmap,

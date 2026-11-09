@@ -118,28 +118,58 @@ where
     }
 }
 
+// Case-insensitive split: find separators in a lowercased copy (index-safe
+// for ASCII operators) and slice the original expression so predicate
+// parsing keeps the original casing of keys and values.
+fn split_ci<'a>(expr: &'a str, sep: &str) -> Vec<&'a str> {
+    let lower = expr.to_lowercase();
+    let mut parts = Vec::new();
+    let mut last = 0;
+    for (pos, _) in lower.match_indices(sep) {
+        parts.push(&expr[last..pos]);
+        last = pos + sep.len();
+    }
+    parts.push(&expr[last..]);
+    parts
+}
+
 impl CompoundPredicate {
     //Parse expresession with 'AND' , 'OR', or single predicates.
     // example
     // - http.status == 500 AND service == auth-service
     // - level == ERROR OR response_time_ms >= 1000
     // - http.status == 500
+    //
+    // Mixing AND and OR is rejected with an error instead of silently
+    // mis-parsing (there is no operator precedence yet). Separators are
+    // matched case-insensitively so "and"/"or" no longer leak into values.
     pub fn parse(expr: &str) -> Result<Self, String> {
         let trimmed = expr.trim();
-        if trimmed.contains(" AND ") {
-            let mut predicates = Vec::new();
-            for part in trimmed.split(" AND ") {
-                predicates.push(Predicate::parse(part.trim())?);
-            }
+        let lower = trimmed.to_lowercase();
+        let has_and = lower.contains(" and ");
+        let has_or = lower.contains(" or ");
+
+        if has_and && has_or {
+            return Err(format!(
+                "Invalid filter expression: {}. Mixing AND and OR is not supported yet; \
+                 use only one connector per expression",
+                trimmed
+            ));
+        }
+        if has_and {
+            let predicates = split_ci(trimmed, " and ")
+                .into_iter()
+                .map(|part| Predicate::parse(part.trim()))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Self {
                 predicates,
                 op: LogicalOperator::And,
             })
-        } else if trimmed.contains(" OR ") {
-            let mut predicates = Vec::new();
-            for part in trimmed.split(" OR ") {
-                predicates.push(Predicate::parse(part.trim())?);
-            }
+        } else if has_or {
+            let predicates = split_ci(trimmed, " or ")
+                .into_iter()
+                .map(|part| Predicate::parse(part.trim()))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(Self {
                 predicates,
                 op: LogicalOperator::Or,
@@ -316,6 +346,25 @@ mod tests {
     //     let log3 = json!({"level": "INFO", "http": {"status": 50}});
     //     assert!(!comp.evaluate(&log3));
     // }
+    #[test]
+    fn test_mixed_and_or_rejected() {
+        // Previously this silently compiled `999 OR level==ERROR` into a
+        // value string comparison and matched nothing.
+        let err = CompoundPredicate::parse("http.status==999 OR level==ERROR AND service==svc");
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn test_lowercase_connectors_work() {
+        let comp = CompoundPredicate::parse("level==ERROR and http.status>=500").unwrap();
+        let log = json!({"level": "ERROR", "http": {"status": 500}});
+        assert!(comp.evaluate(&log));
+
+        let comp_or = CompoundPredicate::parse("level==INFO or http.status>=500").unwrap();
+        let log2 = json!({"level": "INFO", "http": {"status": 500}});
+        assert!(comp_or.evaluate(&log2));
+    }
+
     #[test]
     fn test_predicate_invalid_operator() {
         let err = Predicate::parse("level!=INFO"); // valid operator

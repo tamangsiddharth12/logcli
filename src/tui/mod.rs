@@ -8,7 +8,7 @@ use crossterm::{
     event::{
         self,
         Event::{self},
-        KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyCode, KeyEvent, KeyEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -99,17 +99,7 @@ fn get_inspector_dimensions(app: &App, fetcher: &crate::tui::fetcher::RecordFetc
 }
 pub async fn run_tui(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file_path = args.file.clone();
-    let tui_args = CliArgs {
-        file: file_path.clone(),
-        generate_count: args.generate_count,
-        buffer: args.buffer,
-        valid_out: args.valid_out.clone(),
-        dlq_out: args.dlq_out.clone(),
-        where_clause: args.where_clause.clone(),
-        select_clause: args.select_clause.clone(),
-        format: args.format,
-        tui: args.tui,
-    };
+    let tui_args = args;
 
     //1. Create a bounded channel holding the index
     let (tx, mut rx) = mpsc::channel::<Vec<u64>>(1);
@@ -135,6 +125,9 @@ pub async fn run_tui(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Se
         if let Ok(offsets) = rx.try_recv() {
             app.record_offsets = offsets.clone();
             app.filtered_indices = (0..app.record_offsets.len()).collect();
+            // Index is built and the file is fully available to the fetcher;
+            // mark the app no longer "streaming".
+            app.is_finished = true;
 
             // Initialize the fetcher once we have the offsets and the file
             let file = std::fs::File::open(&file_path)?;
@@ -154,11 +147,6 @@ pub async fn run_tui(args: CliArgs) -> Result<(), Box<dyn std::error::Error + Se
             if let Event::Key(key) = event::read()? {
                 //only trigger on Key press
                 if key.kind == KeyEventKind::Press {
-                    // if let Ok(res) = handle_events(&mut app, fetcher.as_ref(), key)? {
-                    //     if res {
-                    //         return Ok(());
-                    //     }
-                    // }
                     if let Err(e) = handle_events(&mut app, fetcher.as_ref(), key) {
                         eprintln!("Event Error Handling: {}", e);
                     }

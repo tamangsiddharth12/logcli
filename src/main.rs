@@ -3,65 +3,23 @@ use clap::Parser;
 use zedtest::CliArgs;
 use colored::*;
 use zedtest::filter::CompoundPredicate;
-use zedtest::formatter::{Formatter, OutputFormat};
+use zedtest::formatter::{CsvExporter, Formatter, OutputFormat};
 use indicatif::{ProgressBar, ProgressStyle};
 use zedtest::select::Selector;
-use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::Path;
 use tokio::fs::{self, File};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::sync::mpsc::Sender;
 use zedtest::tui;
-
-
-#[derive(Debug, Deserialize)]
-pub struct FlexibleLogEntry {
-    pub timestamp: String,
-    pub service: String,
-    pub level: Option<String>,
-
-    #[serde(flatten)]
-    pub extra_fields: HashMap<String, Value>,
-}
 
 #[derive(Debug)]
 pub struct StreamSummary {
     pub valid_count: usize,
     pub error_count: usize,
-    pub matched_count: usize,
+    pub skipped_blank_count: usize,
 }
 
-use memmap2::Mmap;
-use memchr::memchr;
 use tokio::sync::mpsc::{self};
-// use serde_json::Value;
-
-pub async fn stream_log_file_mpsc_tui(
-    args: CliArgs,
-    tx: Sender<Vec<u64>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let file = std::fs::File::open(&args.file)?;
-    let mmap = unsafe { Mmap::map(&file)? };
-    let data = &mmap[..];
-
-    let mut offsets = Vec::new();
-    offsets.push(0u64);
-
-    let mut curr_pos = 0;
-    while let Some(pos) = memchr(b'\n', &data[curr_pos..]) {
-        curr_pos += pos + 1;
-        offsets.push(curr_pos as u64);
-    }
-
-    // Send the entire index at once to the TUI
-    if tx.send(offsets).await.is_err() {
-        return Err("TUI channel closed".into());
-    }
-
-    Ok(())
-}
 
 pub async fn stream_log_file_mpsc(
     file_path: &str,
@@ -81,7 +39,6 @@ pub async fn stream_log_file_mpsc(
         && !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).await?;
         }
-
     let file_metadata = tokio::fs::metadata(file_path).await?;
     let total_bytes = file_metadata.len();
 
@@ -110,44 +67,54 @@ pub async fn stream_log_file_mpsc(
     let mut summary = StreamSummary {
         valid_count: 0,
         error_count: 0,
-        matched_count: 0,
+        skipped_blank_count: 0,
+    };
+
+    // CSV mode buffers rows so the header can be the union of every record's
+    // keys (with absent keys emitted as empty cells). Trade-off: rows are held
+    // in memory until the stream ends, so CSV export is bounded by output size.
+    // NDJSON / pretty-JSON stay fully streaming.
+    let mut csv_exporter = if format == OutputFormat::Csv {
+        Some(CsvExporter::new())
+    } else {
+        None
     };
 
     let pb = ProgressBar::new(total_bytes);
     pb.set_style(ProgressStyle::default_bar().template("{spinner:.green} Processing [{bar:40.magenta/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, ETA {eta})")?.progress_chars("█▓▒░"));
 
     //Consumer worker loop
-    let mut is_first_record = true;
-
     while let Some(line) = rx.recv().await {
         let bytes_processed = line.len() as u64 + 1;
         pb.inc(bytes_processed);
         let trimmed = line.trim();
         if trimmed.is_empty() {
-            // dlq_writer.write_all(b"Empty lines encountered\n").await?;
-            // summary.error_count += 1;
+            summary.skipped_blank_count += 1;
             continue;
         }
 
-        match serde_json::from_str::<FlexibleLogEntry>(trimmed) {
-            Ok(_) => {
-                let json_val = match serde_json::from_str::<Value>(trimmed) {
-                    Ok(v) => v,
-                    Err(_) => continue,
-                };
+        // Parse each line exactly once. Lines that are valid JSON but lack the
+        // required schema (string 'timestamp' and 'service') are routed to the
+        // DLQ, matching the previous FlexibleLogEntry-based behavior.
+        match serde_json::from_str::<Value>(trimmed) {
+            Ok(json_val) => {
+                let schema_ok = json_val.as_object().is_some()
+                    && json_val.get("timestamp").and_then(Value::as_str).is_some()
+                    && json_val.get("service").and_then(Value::as_str).is_some();
+                if !schema_ok {
+                    summary.error_count += 1;
+                    let err_msg =
+                        format!("Invalid log [missing field `timestamp` or `service`]: {trimmed}\n");
+                    dlq_writer.write_all(err_msg.as_bytes()).await?;
+                    continue;
+                }
+
                 //if where clause is provided, invoke predicate
                 if let Some(ref pred) = predicate
-                    && !pred.evaluate(&json_val) {
-                        continue;
-                    }
-                    // if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
-                    //     if !pred.evaluate(&json_val) {
-                    //         continue; //goes back to top to read another log line
-                    //     }
-                    // else {
-                    //     continue; //goes back to top to read another log line
-                    // }
-                    // }
+                    && !pred.evaluate(&json_val)
+                {
+                    continue;
+                }
 
                 //if select clause is provided, invoke selector
                 let output_json = match &selector {
@@ -155,25 +122,30 @@ pub async fn stream_log_file_mpsc(
                     None => json_val,
                 };
 
-                // Output formatting
-                let formatted_str = Formatter::format(&output_json, format, is_first_record)?;
-                is_first_record = false;
-                // let output_str = serde_json::to_string(&output_json)?;
+                match &mut csv_exporter {
+                    Some(exporter) => exporter.push(&output_json),
+                    None => {
+                        let formatted_str = Formatter::format(&output_json, format)?;
+                        valid_writer.write_all(formatted_str.as_bytes()).await?;
+                        valid_writer.write_all(b"\n").await?;
+                    }
+                }
 
-                summary.matched_count += 1;
                 summary.valid_count += 1;
-                // valid_writer.write_all(output_str.as_bytes()).await?;
-                valid_writer.write_all(formatted_str.as_bytes()).await?;
-                valid_writer.write_all(b"\n").await?;
             }
             Err(err) => {
                 //corrupted JSON
                 summary.error_count += 1;
-                let err_msg = format!("Corrupted log [{}]: {}\n", err, trimmed);
+                let err_msg = format!("Corrupted log [{err}]: {trimmed}\n");
                 dlq_writer.write_all(err_msg.as_bytes()).await?;
-                // dlq_writer.write_all(b"\n").await?;
             }
         }
+    }
+
+    if let Some(exporter) = csv_exporter {
+        let rendered = exporter.render()?;
+        valid_writer.write_all(rendered.as_bytes()).await?;
+        valid_writer.write_all(b"\n").await?;
     }
 
     producer_handle.await??;
@@ -275,7 +247,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "{}\n",
             "==================================================".cyan()
         );
-        //let file_path = "src/production.log";
         let file_path = &input_params.file;
         let channel_capacity = input_params.buffer;
         let valid_out_path = &input_params.valid_out;
@@ -357,6 +328,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             summary.error_count.to_string().red().bold()
         );
         println!(
+            "  • Blank Lines Skipped: {}",
+            summary.skipped_blank_count.to_string().yellow().bold()
+        );
+        println!(
             "  • Throughput Speed:  {}",
             format!("{:.2} MB/s", mb_per_sec).yellow().bold()
         );
@@ -368,72 +343,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     Ok(())
 }
-
-// #[cfg(test)]
-// mod test_cases {
-//     use super::*;
-
-//     #[test]
-//     fn test_parse_ndjson_batch_skips_corrupted_lines() {
-//         let raw = concat!(
-//             r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth", "level": "ERROR", "http": {"method": "POST", "path": "/login", "status": 500, "response_time_ms": 100}}"#,
-//             "\n",
-//             r#"CORRUPTED_LINE_HERE"#,
-//             "\n",
-//             r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "payment", "level": "INFO", "http": {"method": "GET", "path": "/pay", "status": 200, "response_time_ms": 200}}"#
-//         );
-//         let logs = parse_ndjson_batch(raw);
-
-//         assert_eq!(
-//             logs.len(),
-//             2,
-//             "Should parse exactly 2 valid logs and drop 1 corrupted line"
-//         );
-//         assert_eq!(logs[0].service, "auth");
-//         assert_eq!(logs[1].service, "payment");
-//     }
-
-//     #[test]
-//     fn test_calculate_average_latency_normal_and_empty() {
-//         let raw = concat!(
-//             r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "auth", "level": "INFO", "http": {"method": "GET", "path": "/a", "status": 200, "response_time_ms": 100}}"#,
-//             "\n",
-//             r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "auth", "level": "INFO", "http": {"method": "GET", "path": "/b", "status": 200, "response_time_ms": 300}}"#
-//         );
-//         let logs = parse_ndjson_batch(raw);
-//         let avg = calculate_average_latency(&logs);
-//         assert_eq!(avg, 200.0, "Average of 100ms and 300ms should be 200ms");
-
-//         let empty_logs: Vec<ProductionLog> = Vec::new();
-//         let empty_avg = calculate_average_latency(&empty_logs);
-//         assert_eq!(
-//             empty_avg, 0.0,
-//             "Empty logs slice should safely return 0.0 without panicking"
-//         );
-//     }
-
-//     #[test]
-//     fn test_extract_high_seveiry_alerts_criteria() {
-//         let raw = concat!(
-//             // 1. Status >= 400 (matches)
-//             r#"{"timestamp": "2026-07-24T15:00:00Z", "service": "s1", "level": "INFO", "http": {"method": "GET", "path": "/1", "status": 404, "response_time_ms": 50}}"#,
-//             "\n",
-//             // 2. Level ERROR (matches)
-//             r#"{"timestamp": "2026-07-24T15:00:01Z", "service": "s2", "level": "ERROR", "http": {"method": "GET", "path": "/2", "status": 200, "response_time_ms": 50}}"#,
-//             "\n",
-//             // 3. Level FATAL (matches)
-//             r#"{"timestamp": "2026-07-24T15:00:02Z", "service": "s3", "level": "FATAL", "http": {"method": "GET", "path": "/3", "status": 200, "response_time_ms": 50}}"#,
-//             "\n",
-//             // 4. INFO + Status 200 (should BE FILTERED OUT)
-//             r#"{"timestamp": "2026-07-24T15:00:03Z", "service": "s4", "level": "INFO", "http": {"method": "GET", "path": "/4", "status": 200, "response_time_ms": 50}}"#
-//         );
-
-//         let logs = parse_ndjson_batch(raw);
-//         let alerts = extract_high_severity_alerts(logs);
-
-//         assert_eq!(alerts.len(), 3, "Only 3 alerting records should pass");
-//         assert_eq!(alerts[0].service, "s1");
-//         assert_eq!(alerts[1].service, "s2");
-//         assert_eq!(alerts[2].service, "s3");
-//     }
-// }
